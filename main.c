@@ -147,18 +147,32 @@ void simulation_manager(){
     sigdelset(&mask, SIGUSR1);
     sigdelset(&mask, SIGUSR2);
     sigprocmask(SIG_BLOCK, &mask, NULL);
-    //Criação de todos os processos armazém
-    Central();
 
-    Armazens();
+    //Criação de todos os processos armazém
+    int i;
+    for(i = 0; i < n_armazens; i++) {
+        armazem_ids[i] = fork();
+        if (armazem_ids[i] == 0) {
+            Armazens();
+        }
+    }
+
+    printf("aqui depois armazens\n");
 
     //Criação do processo Central, named pipe e threads drone
+    if(fork() == 0){
+        Central();
+        exit(0);
+    }
+    printf("aqui depois central\n");
 
+    refill();
 
 }
 
 void set_msqid(){
     msqid = msgget(IPC_PRIVATE, IPC_CREAT|0700);
+    printf("aqui msqid\n");
 }
 
 void open_sem(){
@@ -192,21 +206,13 @@ void *start_stats(){
 
 
 void Terminate_Central(int signum){
-    close(fd);
+    close(input_pipe);
+    // free drones
+    delete_drones();
     // Release pipe
     unlink(PIPE_NAME);
-    *shared_var_term = 0;
-
-
-    // free drones
-    delete_drones(drone_list);
-    //Acabar os drones... falta listas ligadas das threads
-    /*
-    while(drone_list->next != NULL){
-        drone_list->drone
-    }
-     */
-
+    *shared_var_term = 1;
+    exit(0);
 }
 
 void Terminate(int signum){
@@ -325,7 +331,9 @@ void *drone(void* new_drone){
     int flag = 0;
     Drone *drone = ((Drone*)new_drone);
     printf("Drone <%d> encontra-se em (%.2lf, %.2lf) e esta parado.\n", drone->id, drone->posicao.x, drone->posicao.y);
-    while(*shared_var_term == 0){
+    sem_wait(mutex_end);
+    while(*shared_var_term == 1){
+        pthread_mutex_lock(&drone_mutex);
         if(flag == 0){
             pthread_cond_wait(&drone_cond, &drone_mutex);
             //recebe ordem
@@ -364,6 +372,10 @@ void *drone(void* new_drone){
             }
         }
     }
+    sem_post(mutex_end);
+    pthread_cond_broadcast(&drone_cond);
+    pthread_mutex_unlock(&drone_mutex);
+
     printf("Drone %d a ir embora!\n", drone->id);
     pthread_exit(NULL);
 }
@@ -422,9 +434,9 @@ void choose_closest_drone(Encomenda *encomenda){
     }while(ans != -1);
 }
 
-void create_drones(DroneList * drone_list, ThreadList * thread_id_list) {
+void create_drones() {
     DroneList * cur_drone = drone_list;
-    ThreadList * cur_thread = thread_id_list;
+    ThreadList * cur_thread = thread_id_list->next;
     ThreadList * node_thread;
     DroneList * node_drone;
     Drone * newdrone;
@@ -436,7 +448,6 @@ void create_drones(DroneList * drone_list, ThreadList * thread_id_list) {
     while(cur_thread->next != NULL){
         cur_thread = cur_thread->next;
     }
-
 
     for(int i = 0; i < n_drones; i++) {
 
@@ -481,17 +492,25 @@ ThreadList *create_thread_list() {        // Cria lista com header
     return list;
 }
 
-void delete_drones(DroneList* list){
-    DroneList* cur = list;
-    while(cur != NULL){
-        cur = list->next;
-        free(list);
-        list = cur;
+void delete_drones(){
+    DroneList* cur_drone = drone_list;
+    ThreadList* cur_thread = thread_id_list;
+    while(cur_drone != NULL){
+        cur_drone = drone_list->next;
+        free(drone_list);
+        drone_list = cur_drone;
+    }
+
+    while(cur_thread != NULL){
+        cur_thread = thread_id_list->next;
+        pthread_cancel(cur_thread);
+        pthread_join(cur_thread, NULL);
+        free(thread_id_list);
+        thread_id_list = cur_thread;
     }
 }
 
 void Central(){
-    pid_t p = fork();
     char buf[MAX_CHARS];
     char bufcpy[MAX_CHARS];
     char frase[MAX_CHARS];
@@ -499,65 +518,62 @@ void Central(){
     int n, id = 1;
     int n_drones;
     Encomenda *nova_encomenda;
-    if(p == 0){
-        //Ignorar sinais SIGINT e SIGUSR1
-        sigset_t mask;
-        sigemptyset(&mask);
-        sigaddset(&mask, SIGINT);
-        sigaddset(&mask, SIGUSR1);
-        sigprocmask(SIG_BLOCK, &mask, NULL);
 
-        //Tratar do SIGUSR2
-        struct sigaction fim;
-        fim.sa_handler = Terminate_Central; //funcao por acabar, falta lista ligada das threads drones
-        sigemptyset(&fim.sa_mask);
-        fim.sa_flags = 0;
-        sigaction(SIGUSR2, &fim, NULL);
+    central_id = getpid();
+    //Ignorar sinais SIGINT e SIGUSR1
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &mask, NULL);
 
-        //Criação do named pipe
-        Pipe();
-        //Criação dos drones (threads)
-        drone_list = create_list();
-        thread_id_list = create_thread_list();
-        create_drones(drone_list, thread_id_list);
-        printf("%d\n", getpid());
-        while(1) {
-            n = read(fd, buf, sizeof(buf));
-            strcpy(bufcpy, buf);
-            bufcpy[n - 1] = '\0';
-            command = strtok(buf, " ");
-            if (strcmp(command, "ORDER") == 0) {
-                nova_encomenda = split_command(buf);
-                nova_encomenda->id = id;
-                id++;
-                sprintf(frase, "Encomenda Req_%d-%d recebida pela Central", nova_encomenda->id, id);
-                write_log(frase);
-                choose_closest_drone(nova_encomenda);
-                sem_wait(mutex_esta);
-                shared_var_esta->tot_enc_drones++;
-                sem_post(mutex_esta);
-            } else if (strcmp(command, "DRONE") == 0) {
-                command = strtok(NULL, "SET ");
-                n_drones = atoi(command);
-                sprintf(frase, "Introduzidos mais %d drones.", n_drones);
-                write_log(frase);
-                update_drones(n_drones);
-            } else {
-                sprintf(frase, "Comando inválido introduzido.");
-                write_log(frase);
-                sprintf(frase, "%d\n", getpid());
-                write_log(frase);
-                sleep(2);
-            }
+    //Tratar do SIGUSR2
+    struct sigaction fim;
+    fim.sa_handler = Terminate_Central; //funcao por acabar, falta lista ligada das threads drones
+    sigemptyset(&fim.sa_mask);
+    fim.sa_flags = 0;
+    sigaction(SIGUSR2, &fim, NULL);
+
+    //Criação do named pipe
+    Pipe();
+    //Criação dos drones (threads)
+    drone_list = create_list();
+    thread_id_list = create_thread_list();
+    create_drones();
+
+    while(1){
+        if ((input_pipe = open(PIPE_NAME, O_RDONLY|O_NONBLOCK)) < 0) {
+            perror("Erro a abrir fifo.");
         }
-    }else{
-        central_id = p;
-    }
-    if ((fd = open(PIPE_NAME, O_RDONLY|O_NONBLOCK)) < 0) {
-        perror("Erro a abrir fifo.");
-    }
- }
+        n = read(input_pipe, buf, sizeof(buf));
+        strcpy(bufcpy, buf);
+        bufcpy[n-1] = '\0';
+        command = strtok(buf, " ");
+        if(strcmp(command, "ORDER") == 0){
+            nova_encomenda = split_command(buf);
+            nova_encomenda->id = id;
+            id++;
+            sprintf(frase, "Encomenda Req_%d-%d recebida pela Central", nova_encomenda->id, id);
+            write_log(frase);
+            choose_closest_drone(nova_encomenda);
+            sem_wait(mutex_esta);
+            shared_var_esta->tot_enc_drones++;
+            sem_post(mutex_esta);
+        }
+        else if(strcmp(command, "DRONE") == 0){
+            command = strtok(NULL, "SET ");
+            n_drones = atoi(command);
+            sprintf(frase, "Introduzidos mais %d drones.", n_drones);
+            write_log(frase);
+            update_drones(n_drones);
+        }
+        else{
+            sprintf(frase, "Comando inválido introduzido.");
+            write_log(frase);
+        }
 
+    }
+}
 
 void update_drones(int quant){
     n_drones += quant;
@@ -593,7 +609,7 @@ void update_drones(int quant){
         node_drone->next = NULL;
         cur_drone = node_drone;
         cur_thread = node_thread;
-        if(pthread_create(&Thread_ids[i], NULL, drone, newdrone)){
+        if(pthread_create(cur_thread, NULL, drone, newdrone)){
             perror("Erro ao criar as threads.");
             exit(0);
         }
@@ -619,90 +635,86 @@ Encomenda *split_command(char *command) {
     return encomenda;
 }
 
-void Armazens(){
-    int i ,x;
-    char buffer[512];
+void Armazens(int i){
+    int x;
     Armazem *armazem_atual;
     Produto *produto_atual;
-    for(i = 0; i < n_armazens; i++){
-        armazem_ids[i] = fork();
-        sleep(1);
-        if(armazem_ids[i] == 0){
-            //___________________Armazem bloqueia todos os sinais_________________
-            sigset_t block;
-            sigfillset(&block);
-            sigprocmask(SIG_BLOCK, &block, NULL);
-            //____________________________________________________________________
+    char buffer[512];
+    //___________________Armazem bloqueia todos os sinais_________________
+    sigset_t block;
+    sigfillset(&block);
+    sigprocmask(SIG_BLOCK, &block, NULL);
+    //____________________________________________________________________
 
-            armazem_atual = &shared_var_armazem[i];
+    armazem_atual = &shared_var_armazem[i];
+
+    sem_wait(mutex_wh);
+    printf("Armazem %d criado em (%.2lf,%.2lf) e tem %d tipos de produtos diferentes.\n",armazem_atual->id, armazem_atual->coordenadas.x, armazem_atual->coordenadas.y, armazem_atual->count_tipos);
+    //O PID de cada um dos processos armazém criados e o seu W_NO deverão ser escritos no ecrã e no log.
+    sprintf(buffer, "Armazém com o numero %d e PID %d criado.",armazem_atual->id, getpid());
+    sem_post(mutex_wh);
+    write_log(buffer);
+
+    while(1){
+        mq_to_armazem in_msg;
+        mq_from_armazem out_msg;
+
+        //Resposta do drone
+        msgrcv(msqid, &in_msg, sizeof(mq_to_armazem), armazem_atual->id, 0);
+
+        //Chegada de drones
+        if(in_msg.tipo == CHEGADA){
+            sem_wait(mutex_wh);
+            printf("Armazem %s [id = %d] pronto para carregamento.\n",armazem_atual->nome, armazem_atual->id);
+            sem_post(mutex_wh);
+            sleep(in_msg.quant * temp);
+            sem_wait(mutex_esta);
+            shared_var_esta->tot_prod_carregados_armazens += in_msg.quant;
+            sem_post(mutex_esta);
+            //Responder ao drone
+            out_msg.id_encomenda = in_msg.id_encomenda;
+            msgsnd(msqid, &out_msg, sizeof(mq_from_armazem), 0);
 
             sem_wait(mutex_wh);
-            printf("Armazem %d criado em (%.2lf,%.2lf) e tem %d tipos de produtos diferentes.\n",armazem_atual->id, armazem_atual->coordenadas.x, armazem_atual->coordenadas.y, armazem_atual->count_tipos);
-            //O PID de cada um dos processos armazém criados e o seu W_NO deverão ser escritos no ecrã e no log.
-            sprintf(buffer, "Armazém com o numero %d e PID %d criado.",armazem_atual->id, getpid());
+            printf("Armazem %s [id = %d] acabou o carregamento.\n",armazem_atual->nome, armazem_atual->id);
             sem_post(mutex_wh);
-            write_log(buffer);
-            while(1){
-                mq_to_armazem in_msg;
-                mq_from_armazem out_msg;
 
-                //Resposta do armazem
-                printf("aqui antes de msgrcv armazem.\n");
-                msgrcv(msqid, &in_msg, sizeof(mq_to_armazem), armazem_atual->id, 0);
-                //Chegada de drones
-                if(in_msg.tipo == CHEGADA){
-                    sem_wait(mutex_wh);
-                    printf("Armazem %s [id = %d] pronto para carregamento.\n",armazem_atual->nome, armazem_atual->id);
-                    sem_post(mutex_wh);
-                    sleep(in_msg.quant * temp);
-                    sem_wait(mutex_esta);
-                    shared_var_esta->tot_prod_carregados_armazens += in_msg.quant;
-                    sem_post(mutex_esta);
-                    //Responder ao drone
-                    out_msg.id_encomenda = in_msg.id_encomenda;
-                    msgsnd(msqid, &out_msg, sizeof(mq_from_armazem), 0);
-
-                    sem_wait(mutex_wh);
-                    printf("Armazem %s [id = %d] acabou o carregamento.\n",armazem_atual->nome, armazem_atual->id);
-                    sem_post(mutex_wh);
-
-                //Refill dos armazens
-                } else if(in_msg.tipo == REFILL){
-                    sem_wait(mutex_wh);
-                    //Encontrar o produto
-                    for(x = 0; x < armazem_atual->count_tipos; x++){
-                        produto_atual = &armazem_atual->produtos[x];
-                        if(strcmp(produto_atual->tipo, in_msg.produto) == 0){
-                            produto_atual->quantidade += in_msg.quant;
-                            sprintf(buffer, "Armazem %s [id = %d] recarregado.\n", armazem_atual->nome, armazem_atual->id);
-                            sem_post(mutex_wh);
-                            write_log(buffer);
-                        }
-                    }
-                }
-                else{
-                    sem_wait(mutex_wh);
-                    sprintf(buffer, "Armazem %s [id = %d] fechado.\n",armazem_atual->nome, armazem_atual->id);
+        //Refill dos armazens
+        } else if(in_msg.tipo == REFILL){
+            sem_wait(mutex_wh);
+            //Encontrar o produto
+            for(x = 0; x < armazem_atual->count_tipos; x++){
+                produto_atual = &armazem_atual->produtos[x];
+                if(strcmp(produto_atual->tipo, in_msg.produto) == 0){
+                    //Atualizar stock
+                    produto_atual->quantidade += in_msg.quant;
+                    sprintf(buffer, "Armazem %s [id = %d] recarregado.\n", armazem_atual->nome, armazem_atual->id);
                     sem_post(mutex_wh);
                     write_log(buffer);
-                    exit(0);
                 }
             }
         }
-        wait(NULL);
+        else{
+            sem_wait(mutex_wh);
+            sprintf(buffer, "Armazem %s [id = %d] fechado.\n",armazem_atual->nome, getpid());
+            sem_post(mutex_wh);
+            write_log(buffer);
+            exit(0);
+        }
     }
 }
 
 
 void refill(){
-    int i, x, prod;
+    int i = 0, id, x, prod;
     Produto produto;
     time_t t;
     srand((unsigned) time(&t));
     mq_to_armazem out_msg;
     out_msg.tipo = REFILL;
-    //Percorrer os armazens
-    for(i = 0; i < n_armazens; i++){
+    while(1){
+        id = (i++ % n_armazens) +1;
+        //Percorrer os armazens
         out_msg.id_armazem = i+1;
 
         //Escolher um produto random
@@ -718,7 +730,9 @@ void refill(){
         strcpy(out_msg.produto, produto.tipo);
         out_msg.quant = quant;
         msgsnd(msqid, &out_msg, sizeof(mq_to_armazem), 0);
+        usleep(freq_de_abastecimento*1000000);
     }
+
 
 }
 
@@ -729,10 +743,6 @@ int main() {
 
     simulation_manager();
 
-    while(1){
-        refill();
-        usleep(freq_de_abastecimento * 1000000);
-    }
 
     return 0;
 }
